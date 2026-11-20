@@ -32,6 +32,15 @@ const RETRY_MAX_MS = 2_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Wait for the listener to release its ephemeral port before the harness stops the process. */
+function closeServer(server: ReturnType<typeof createApp>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((err) => err ? reject(err) : resolve());
+    // Release pooled HTTP connections once the suite has finished its last request.
+    server.closeIdleConnections();
+  });
+}
+
 /** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
 function retryDelay(attempt: number): number {
   return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
@@ -51,8 +60,15 @@ async function register(port: number): Promise<void> {
         body: JSON.stringify({ port }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      if (res.status === 200 || res.status === 409) return;
-      if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
+      if (res.status === 200 || res.status === 409) {
+        await res.arrayBuffer();
+        return;
+      }
+      if (res.status === 400 || res.status === 405) {
+        const detail = await res.text();
+        throw new Error(`register answered HTTP ${res.status}: ${detail}`);
+      }
+      await res.arrayBuffer();
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
     }
@@ -66,8 +82,11 @@ async function waitForDone(): Promise<void> {
     try {
       const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
       if (res.ok) {
-        const body = (await res.json()) as { done?: unknown };
-        if (body.done === true) return;
+        const body: unknown = await res.json();
+        if (typeof body === 'object' && body !== null && 'done' in body && body.done === true) return;
+        attempt = -1;
+      } else {
+        await res.arrayBuffer();
       }
     } catch {
       // The env is not answering yet, or the poll timed out: it is not done, so poll again.
@@ -91,7 +110,7 @@ async function main(): Promise<void> {
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
-  server.close();
+  await closeServer(server);
   process.stdout.write('[entry] done\n');
 }
 
